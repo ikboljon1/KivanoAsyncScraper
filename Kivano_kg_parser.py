@@ -1,68 +1,89 @@
+import asyncio
+import aiohttp
+from aiohttp import ClientSession
 import bs4
-import requests
-import xlsxwriter
+import csv
+from tqdm import tqdm
 
-main_url = 'https://kivano.kg'
-headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36'}
+MAIN_URL = 'https://kivano.kg'
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36'
+}
 
-# Создаем список для хранения данных
-data = [['name','description','category_id','brand_id','video_provider','video_link','tags','unit_price','purchase_price','unit','slug','current_stock','sku','meta_title','meta_description','thumbnail_img','photos']]
 
-# Функция для получения объекта BeautifulSoup
-def get_soup(url, headers):
-    res = requests.get(url, headers=headers)
-    return bs4.BeautifulSoup(res.text, 'html.parser')
+async def fetch(url, session):
+    async with session.get(url, headers=HEADERS) as response:
+        return await response.text()
 
-# Перебираем все страницы категории
-page_num = 1
-while page_num<=15:
-    # Получаем страницу категории
-    category_page = get_soup(main_url + '/dukhovki?page=' + str(page_num), headers)
 
-    # Получаем все товары на странице
-    products = category_page.find_all('div', class_='item product_listbox oh')
+async def get_soup(url, session):
+    html = await fetch(url, session)
+    return bs4.BeautifulSoup(html, 'html.parser')
 
-    # Если на странице нет товаров, значит достигнут конец категории
-    if len(products) == 0:
-        break
 
-    # Обходим все товары и получаем необходимые данные
+async def parse_product(product, session):
+    url = MAIN_URL + product.find('div', class_='listbox_title oh').find('a')['href']
+
+    soup = await get_soup(url, session)
+
+    name = product.find('div', class_='listbox_title oh').text.strip()
+
+    price = ''.join(
+        filter(str.isdigit, product.find('div', class_='listbox_price text-center').find('strong').text.strip()))
+
+    img_div = soup.find('div', class_='img_full addlight')
+    img_url = 'https://kivano.kg' + img_div.find('a')['href'] if img_div else 'No image'
+
+    description = soup.find('div', {'id': 'desc'}).text.strip()
+
+    data = {
+        'name': name,
+        'price': price,
+        'img_url': img_url,
+        'description': description
+    }
+
+    return data
+
+
+async def parse(url, session):
+    print(f'Парсинг {url}')
+    soup = await get_soup(url, session)
+
+    products = soup.find_all('div', class_='item product_listbox oh')
+
+    tasks = []
     for product in products:
-        name = product.find('div', class_='listbox_title oh').text.strip()
-        unit_price = ''.join(filter(str.isdigit, product.find('div', class_='listbox_price text-center').find('strong').text.strip()))
-        category_id = '105'
-        brand_id = '1'
-        video_provider = 'youtube'
-        video_link = ''
-        tags = 'кастрюли'
-        purchase_price = ''
-        unit = 'шт'
-        slug = ''
-        current_stock = '10'
-        sku = ''
-        meta_title = name
-         
-        # Получаем ссылку на страницу товара
-        product_url = main_url + product.find('div', class_='listbox_title oh').find('a')['href']
-        print(product_url)
+        task = asyncio.create_task(parse_product(product, session))
+        tasks.append(task)
 
-        # Заходим на страницу товара и получаем ссылку на изображение
-        product_page = get_soup(product_url, headers)
-        img_div = product_page.find('div', class_='img_full addlight')
-        if img_div is not None:
-            thumbnail_img = 'https://kivano.kg'+img_div.find('a')['href']
-        else:
-            thumbnail_img = 'No image found'
-        photos = thumbnail_img
-        description = product_page.find('div', {'id': 'desc'}).text.strip()
-        meta_description = description
-        data.append([name,description,category_id,brand_id,video_provider,video_link,tags,unit_price,purchase_price,unit,slug,current_stock,sku,meta_title,meta_description,thumbnail_img,photos])
+    data = await asyncio.gather(*tasks)
+    return data
 
-    # Увеличиваем номер страницы
-    page_num += 1
 
-# Записываем данные в файл Excel
-with xlsxwriter.Workbook('duhovki.xlsx') as workbook:
-    worksheet = workbook.add_worksheet()
-    for row_num, info in enumerate(data):
-        worksheet.write_row(row_num, 0, info)
+async def main(urls):
+    async with ClientSession() as session:
+        tasks = []
+        for url in urls:
+            task = asyncio.create_task(parse(url, session))
+            tasks.append(task)
+
+        pages_data = await asyncio.gather(*tasks)
+
+        products_data = []
+        for page_data in pages_data:
+            products_data.extend(page_data)
+
+        print(f'Получено {len(products_data)} продуктов')
+
+        # сохраняем данные в CSV
+        with open('products.csv', 'w') as f:
+            writer = csv.DictWriter(f, fieldnames=products_data[0].keys())
+            writer.writeheader()
+            writer.writerows(products_data)
+
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    category_urls = [f'{MAIN_URL}/dukhovki?page={page}' for page in range(1, 5)]
+    loop.run_until_complete(main(category_urls))
+    loop.close()
